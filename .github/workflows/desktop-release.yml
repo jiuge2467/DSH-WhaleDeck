@@ -1,0 +1,121 @@
+name: Build & Release DSH Studio Desktop
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release version tag (e.g. v0.1.0)'
+        required: false
+        default: 'v0.1.0'
+
+permissions:
+  contents: write
+
+jobs:
+  build-desktop:
+    name: Build Desktop (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            target: win-x64
+            pack_script: pack:win
+            artifact_pattern: 'apps/desktop/release/*.exe'
+          - os: macos-latest
+            target: mac-arm64
+            pack_script: pack:mac
+            artifact_pattern: 'apps/desktop/release/*.dmg'
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v3
+        with:
+          version: 11.7.0
+
+      - name: Setup Node.js 24
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: 'pnpm'
+
+      - name: Install Dependencies
+        run: pnpm install
+
+      - name: Build Core Libraries & Web Frontend
+        run: pnpm run build
+
+      - name: Build Desktop Application & Bundle
+        run: pnpm run desktop:build
+
+      - name: Run Desktop Test Suite
+        run: pnpm run desktop:test
+
+      - name: Package Desktop Binary (${{ matrix.target }})
+        run: pnpm --filter @deepseek-ai/dsh-desktop run ${{ matrix.pack_script }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Generate SHA-256 Checksums
+        shell: bash
+        run: |
+          cd apps/desktop/release
+          if [ "${{ runner.os }}" == "Windows" ]; then
+            certutil -hashfile *.exe SHA256 > checksums-${{ matrix.target }}.sha256.txt || true
+          else
+            shasum -a 256 *.dmg > checksums-${{ matrix.target }}.sha256.txt || true
+          fi
+
+      - name: Upload Build Artifacts to GitHub Actions
+        uses: actions/upload-artifact@v4
+        with:
+          name: dsh-studio-desktop-${{ matrix.target }}
+          path: |
+            ${{ matrix.artifact_pattern }}
+            apps/desktop/release/*.sha256.txt
+
+  publish-release:
+    name: Publish GitHub Release
+    needs: [build-desktop]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Download All Build Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-artifacts
+
+      - name: Prepare Release Assets
+        run: |
+          mkdir -p dist-assets
+          find release-artifacts -type f -exec cp {} dist-assets/ \;
+          ls -la dist-assets/
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/v')
+        with:
+          name: DSH Studio Desktop ${{ github.ref_name }}
+          body: |
+            ## 🚀 DSH Studio Desktop 桌面端正式发布
+
+            现代化 DeepSeek Harness 全栈增强工作台 · 多源 MCP 可视化调试中枢 · 视觉思考引擎 · 灵动极客伴侣。
+
+            ### 📦 下载与安装 (Zero-Dependency)
+            * **Windows x64**：下载 `DSH-Studio-Setup-*-win-x64.exe`，双击 NSIS 安装程序一键完成安装。
+            * **macOS Apple Silicon**：下载 `DSH-Studio-*-mac-arm64.dmg`，打开并拖入 `Applications` 即可启动。
+
+            ### 校验和 (SHA-256)
+            见下方 release 附带的 `.sha256.txt` 校验和文件。
+          files: dist-assets/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

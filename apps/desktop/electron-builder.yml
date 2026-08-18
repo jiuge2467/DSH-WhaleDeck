@@ -1,0 +1,54 @@
+appId: com.deepseek.dsh.studio
+productName: DSH Studio
+copyright: Copyright © 2026 DeepSeek AI & Community
+artifactName: ${productName}-${version}-${os}-${arch}.${ext}
+
+directories:
+  output: release
+  buildResources: resources
+
+files:
+  - lib/**/*
+  - resources/**/*
+  - package.json
+
+extraResources:
+  - from: bundled-server
+    to: bundled-server
+
+asar: true
+
+win:
+  target:
+    - target: nsis
+      arch:
+        - x64
+  icon: resources/icon.png
+
+nsis:
+  oneClick: false
+  allowToChangeInstallationDirectory: true
+  allowElevation: true
+  createDesktopShortcut: true
+  createStartMenuShortcut: true
+  shortcutName: DSH Studio
+  runAfterFinish: true
+
+mac:
+  target:
+    - target: dmg
+      arch:
+        - arm64
+  icon: resources/icon.png
+  category: public.app-category.developer-tools
+  darkModeSupport: true
+  minimumSystemVersion: 13.0.0
+
+dmg:
+  contents:
+    - x: 130
+      y: 220
+    - x: 410
+      y: 220
+      type: link
+      path: /Applications

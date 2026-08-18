@@ -1,0 +1,37 @@
+# DSH Studio Default Plugins Patch Layer
+- insert:
+    - id: ui-web-ui-settings
+      name: '@linxin666/dsh-client-ui-web-ui-settings'
+
+    - id: ui-task-board
+      name: '@linxin666/dsh-client-ui-task-board'
+
+    - id: remote-web-ui
+      name: '@linxin666/dsh-remote-web-ui'
+
+    - id: live-stats
+      name: '@linxin666/dsh-live-stats'
+
+    - id: ssh
+      name: '@linxin666/dsh-ssh'
+
+    - id: describe-image
+      name: '@linxin666/dsh-tool-describe-image'
+
+    - id: liangshen
+      name: '@linxin666/dsh-liangshen'
+
+    - id: ui-skin-center
+      name: '@linxin666/dsh-client-ui-skin-center'
+
+    - id: better-sidebar
+      name: 'dsh-better-sidebar'
+
+    - id: better-sidebar-skills
+      name: 'dsh-better-sidebar-skills'
+
+    - id: better-sidebar-mcp
+      name: 'dsh-better-sidebar-mcp'
+
+    - id: mascot-pet
+      name: 'dsh-mascot-pet'

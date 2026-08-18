@@ -1,0 +1,27 @@
+{
+  "name": "@deepseek-ai/dsh-desktop",
+  "description": "DSH Studio Desktop Application - Standalone Electron Host for DeepSeek Harness Studio",
+  "version": "0.1.0-rc.5",
+  "author": "DeepSeek AI & Community",
+  "private": true,
+  "type": "module",
+  "main": "lib/main/index.js",
+  "scripts": {
+    "build:main": "tsc -p tsconfig.json",
+    "build": "pnpm run build:main && tsx scripts/prepare-bundle.ts",
+    "dev": "pnpm run build:main && electron .",
+    "test": "vitest run --root ../.. apps/desktop/tests",
+    "check:bundle-integrity": "node -e \"const {readdirSync,existsSync}=require('fs'),{join}=require('path');function check(d,depth=0){if(!existsSync(d))return;for(const e of readdirSync(d,{withFileTypes:true})){if(e.isDirectory()){const f=join(d,e.name);if(e.name==='node_modules'&&depth>0){console.error('FAIL: Nested node_modules found at',f);process.exit(1)}else check(f,depth+1)}}}check('bundled-server/node_modules');console.log('✅ Bundle integrity passed: No nested node_modules found.');\"",
+    "pack:win": "pnpm run build && electron-builder --win --x64",
+    "pack:mac": "pnpm run build && electron-builder --mac --arm64",
+    "pack:dir": "pnpm run build && electron-builder --dir"
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.0",
+    "electron": "^37.0.0",
+    "electron-builder": "^25.1.8",
+    "tsx": "^4.22.4",
+    "typescript": "^6.0.3",
+    "vitest": "^4.1.8"
+  }
+}

@@ -1,0 +1,307 @@
+/**
+ * Connection pool: per-alias persistent ssh2 connections with multi-hop jump
+ * support, the acquire / dispose / sweep lifecycle, and the pooled exec path.
+ */
+
+import { existsSync, readFileSync } from 'node:fs'
+import { Client, type ConnectConfig } from 'ssh2'
+import type { ExecResult, SshHostEntry } from '../protocol.ts'
+import { expandHome, type HostStore } from '../store.ts'
+
+/** Default engine knobs. */
+export interface EngineOptions {
+  /** Connections idle longer than this are closed (ms). */
+  idleTimeoutMs?: number
+  /** SSH handshake timeout (ms). */
+  connectTimeoutMs?: number
+  /** Keepalive ping interval (ms). */
+  keepaliveIntervalMs?: number
+  /** Cap on captured stdout/stderr bytes per exec (ms). */
+  maxOutputBytes?: number
+  /** Default exec timeout (ms). */
+  defaultExecTimeoutMs?: number
+  /** Default cluster concurrency. */
+  defaultMaxWorkers?: number
+  /** SFTP concurrent channel count for transfers. */
+  sftpConcurrency?: number
+}
+
+/** Default engine knobs (applied when an option is omitted). */
+export const DEFAULTS: Required<EngineOptions> = {
+  idleTimeoutMs: 30 * 60_000,
+  connectTimeoutMs: 15_000,
+  keepaliveIntervalMs: 15_000,
+  maxOutputBytes: 2 * 1024 * 1024,
+  defaultExecTimeoutMs: 60_000,
+  defaultMaxWorkers: 8,
+  sftpConcurrency: 8,
+}
+
+/** One pooled connection record. */
+export interface PoolRecord {
+  client: Client
+  /** Jump-chain clients kept alive under the target. */
+  hops: Client[]
+  idleAt: number
+  /** Pinned connections (tunnels) are never swept. */
+  pinned: boolean
+  broken: boolean
+  /** Operations currently running on this connection (sweep guard). */
+  inFlight: number
+}
+
+/**
+ * The slice of the engine the pool and exec paths need. The host class
+ * (engine.ts facade) satisfies this structurally.
+ */
+export interface PoolEngine {
+  readonly store: HostStore
+  readonly opts: Required<EngineOptions>
+  readonly pool: Map<string, PoolRecord>
+  readonly acquireQueue: Map<string, Promise<PoolRecord>>
+}
+
+/** Build the ssh2 connect config for one entry (key read from disk). */
+export function buildConnectConfig(entry: SshHostEntry, sock?: ConnectConfig['sock']): ConnectConfig {
+  const config: ConnectConfig = {
+    host: entry.host,
+    port: entry.port,
+    username: entry.user,
+    readyTimeout: 15_000,
+    keepaliveInterval: 15_000,
+    keepaliveCountMax: 3,
+  }
+  if (sock !== undefined) config.sock = sock
+  if (entry.auth.kind === 'password') {
+    config.password = entry.auth.password
+  } else {
+    const keyPath = entry.auth.keyPath === undefined ? undefined : expandHome(entry.auth.keyPath)
+    if (keyPath === undefined || !existsSync(keyPath)) {
+      throw new Error('private key not found: ' + (entry.auth.keyPath ?? '(unset)'))
+    }
+    config.privateKey = readFileSync(keyPath, 'utf8')
+    if (entry.auth.passphrase !== undefined && entry.auth.passphrase !== '') {
+      config.passphrase = entry.auth.passphrase
+    }
+  }
+  return config
+}
+
+/** Connect one ssh2 client (resolve on ready, reject on error/close). */
+function connectClient(config: ConnectConfig): Promise<Client> {
+  return new Promise((resolve, reject) => {
+    const client = new Client()
+    let settled = false
+    client.once('ready', () => {
+      if (settled) return
+      settled = true
+      resolve(client)
+    })
+    client.once('error', (error) => {
+      if (settled) return
+      settled = true
+      reject(error instanceof Error ? error : new Error(String(error)))
+    })
+    try {
+      client.connect(config)
+    } catch (error) {
+      if (!settled) {
+        settled = true
+        reject(error instanceof Error ? error : new Error(String(error)))
+      }
+    }
+  })
+}
+
+/** Cap captured output at the configured byte budget (marks truncation). */
+export function appendOutput(target: { text: string; truncated: boolean }, chunk: Buffer, maxBytes: number): void {
+  if (target.truncated) return
+  if (target.text.length + chunk.length > maxBytes) {
+    let cut = chunk.toString('utf8').slice(0, maxBytes - target.text.length)
+    // Never split a surrogate pair at the cut boundary.
+    if (/[\uD800-\uDBFF]$/.test(cut)) cut = cut.slice(0, -1)
+    target.text += cut + '…[output truncated]'
+    target.truncated = true
+    return
+  }
+  target.text += chunk.toString('utf8')
+}
+
+/**
+ * Build one full jump chain for an entry: hop clients connected through in
+ * order, each forwarding a stream to the next destination, ending with the
+ * target client. Shared by the pool and standalone shell sessions.
+ */
+export async function connectChain(engine: PoolEngine, entry: SshHostEntry): Promise<{ client: Client; hops: Client[] }> {
+  const hops: Client[] = []
+  let sock: ConnectConfig['sock']
+  const chain = entry.proxyJump
+  for (let index = 0; index < chain.length; index += 1) {
+    const hopAlias = chain[index]
+    const hop = engine.store.find(hopAlias)
+    if (hop === undefined) {
+      for (const client of hops) client.end()
+      throw new Error('proxyJump alias \'' + hopAlias + '\' not found — create it first')
+    }
+    const hopClient = await connectClient(buildConnectConfig(hop, sock))
+    hops.push(hopClient)
+    const next = index + 1 < chain.length ? engine.store.find(chain[index + 1]) : undefined
+    const nextHost = next !== undefined ? next.host : entry.host
+    const nextPort = next !== undefined ? next.port : entry.port
+    sock = await new Promise<ConnectConfig['sock']>((resolve, reject) => {
+      hopClient.forwardOut('127.0.0.1', 0, nextHost, nextPort, (error, stream) => {
+        if (error !== undefined) {
+          for (const client of hops) client.end()
+          reject(error)
+        } else {
+          resolve(stream)
+        }
+      })
+    })
+  }
+  try {
+    const client = await connectClient(buildConnectConfig(entry, sock))
+    return { client, hops }
+  } catch (error) {
+    for (const client of hops) client.end()
+    throw error
+  }
+}
+
+/** Connect (or reuse) the pooled chain for one alias; pins nothing. */
+export async function acquire(engine: PoolEngine, alias: string): Promise<PoolRecord> {
+  const pending = engine.acquireQueue.get(alias)
+  if (pending !== undefined) return pending
+  const task = doAcquire(engine, alias)
+  engine.acquireQueue.set(alias, task)
+  try {
+    return await task
+  } finally {
+    if (engine.acquireQueue.get(alias) === task) engine.acquireQueue.delete(alias)
+  }
+}
+
+async function doAcquire(engine: PoolEngine, alias: string): Promise<PoolRecord> {
+  const entry = engine.store.find(alias)
+  if (entry === undefined) throw new Error('alias \'' + alias + '\' not found — add it first')
+  const { client, hops } = await connectChain(engine, entry)
+  const record: PoolRecord = { client, hops, idleAt: Date.now(), pinned: false, broken: false, inFlight: 0 }
+  client.on('error', () => { record.broken = true })
+  client.on('close', () => { record.broken = true })
+  engine.pool.set(alias, record)
+  return record
+}
+
+/**
+ * Tear down one alias's record. When `record` is given and no longer the
+ * pooled record for the alias (a concurrent acquire replaced it), nothing
+ * is torn down — the connection belongs to someone else now.
+ */
+export function disposeRecord(engine: PoolEngine, alias: string, record?: PoolRecord): void {
+  const current = engine.pool.get(alias)
+  if (record !== undefined && current !== record) return
+  if (current === undefined) return
+  engine.pool.delete(alias)
+  try { current.client.end() } catch { /* already closed */ }
+  for (const hop of current.hops) {
+    try { hop.end() } catch { /* already closed */ }
+  }
+}
+
+/** Close connections idle beyond the threshold (skips pinned and in-flight). */
+export function sweepPool(engine: PoolEngine): void {
+  const cutoff = Date.now() - engine.opts.idleTimeoutMs
+  for (const [alias, record] of engine.pool) {
+    if (!record.pinned && record.inFlight === 0 && record.idleAt < cutoff) {
+      disposeRecord(engine, alias, record)
+    }
+  }
+}
+
+/**
+ * Run `fn` with a live client for `alias`, reconnecting (up to the
+ * attempt budget) when the connection broke mid-flight.
+ */
+export async function withClient<T>(engine: PoolEngine, alias: string, fn: (client: Client) => Promise<T>, attempts = 3): Promise<T> {
+  let lastError: unknown
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    let record = engine.pool.get(alias)
+    if (record === undefined || record.broken) {
+      if (record !== undefined) disposeRecord(engine, alias, record)
+      record = await acquire(engine, alias)
+    }
+    record.idleAt = Date.now()
+    record.inFlight += 1
+    try {
+      const result = await fn(record.client)
+      record.idleAt = Date.now()
+      return result
+    } finally {
+      record.inFlight -= 1
+    }
+  }
+  throw lastError instanceof Error ? lastError : new Error(String(lastError))
+}
+
+/** Run one command on `alias` (reusing the pooled connection). */
+export async function execCommand(engine: PoolEngine, alias: string, command: string, timeoutMs?: number): Promise<ExecResult> {
+  const started = Date.now()
+  const budget = timeoutMs !== undefined && timeoutMs > 0 ? timeoutMs : engine.opts.defaultExecTimeoutMs
+  return withClient(engine, alias, async (client) => {
+    return await new Promise<ExecResult>((resolve, reject) => {
+      client.exec(command, (error, stream) => {
+        if (error !== undefined) {
+          reject(error)
+          return
+        }
+        const stdout = { text: '', truncated: false }
+        const stderr = { text: '', truncated: false }
+        let timedOut = false
+        let settled = false
+        const finish = (): void => {
+          if (settled) return
+          settled = true
+          clearTimeout(timer)
+          resolve({
+            success: false,
+            exitCode: null,
+            timedOut,
+            stdout: stdout.text,
+            stderr: stderr.text,
+            durationMs: Date.now() - started,
+            error: timedOut ? 'command timed out after ' + budget + ' ms' : undefined,
+          })
+        }
+        const timer = setTimeout(() => {
+          timedOut = true
+          try { stream.signal('KILL') } catch { /* channel gone */ }
+          try { stream.close() } catch { /* channel gone */ }
+          // Hard deadline: settle now even if the peer never acks the
+          // channel close (the stream 'close' handler is then a no-op).
+          finish()
+        }, budget)
+        stream.on('data', (chunk: Buffer) => appendOutput(stdout, chunk, engine.opts.maxOutputBytes))
+        stream.stderr.on('data', (chunk: Buffer) => appendOutput(stderr, chunk, engine.opts.maxOutputBytes))
+        stream.on('close', (code: number | null) => {
+          if (settled) return
+          settled = true
+          clearTimeout(timer)
+          resolve({
+            success: code === 0 && !timedOut,
+            exitCode: code,
+            timedOut,
+            stdout: stdout.text,
+            stderr: stderr.text,
+            durationMs: Date.now() - started,
+          })
+        })
+        stream.on('error', (streamError: Error) => {
+          if (settled) return
+          settled = true
+          clearTimeout(timer)
+          reject(streamError)
+        })
+      })
+    })
+  })
+}
