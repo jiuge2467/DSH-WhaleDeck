@@ -36,6 +36,13 @@ While upstream DSH is exceptionally capable, its native CLI interface and runtim
 </p>
 
 ---
+## 📥 Download
+
+| Platform | Download Link | File Size |
+| :--- | :--- | :--- |
+| **Windows (x64)** | [👉 Download Windows Installer (.exe)](https://github.com/jiuge2467/DSH-WhaleDeck/releases/download/v1.0.0/DSH.Studio-0.1.0-rc.5-win-x64.exe) | ~234 MB |
+
+> 💡 **Tip**: For older versions or detailed changelogs, please visit the [GitHub Releases](https://github.com/jiuge2467/DSH-WhaleDeck/releases) page.
 
 ## ✨ Key Highlights
 
