@@ -36,7 +36,13 @@
 </p>
 
 ---
+## 📥 软件下载
 
+| 系统平台 | 下载链接 | 文件大小 |
+| :--- | :--- | :--- |
+| **Windows x64** | [👉 点击直接下载 Windows 安装包 (.exe)](https://github.com/jiuge2467/DSH-WhaleDeck/releases/download/v1.0.0/DSH.Studio-0.1.0-rc.5-win-x64.exe) | ~234 MB |
+
+> 💡 **提示**：如果下载速度较慢，请多次刷新或使用下载加速工具。
 ## ✨ 核心亮点一览
 
 * 🚀 **零门槛双击即用**：提供 Windows x64 与 macOS Apple Silicon 独立桌面安装包，无需手动配置 Node.js 或终端命令。
